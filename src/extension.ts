@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { translateMarkdown } from './translator';
 import { renderResultHtml, renderLoadingHtml, renderErrorHtml } from './webview';
 import {
@@ -14,6 +15,19 @@ let panel: vscode.WebviewPanel | undefined;
 let lastDocUri: vscode.Uri | undefined;
 let lastTranslation: string | undefined;
 let secrets: vscode.SecretStorage;
+let activeRequest: AbortController | undefined;
+let followTimer: ReturnType<typeof setTimeout> | undefined;
+const translationCache = new Map<string, string>();
+
+function isMarkdown(document: vscode.TextDocument) {
+  return document.languageId === 'markdown' || document.languageId === 'skill';
+}
+
+function cancelPending() {
+  clearTimeout(followTimer);
+  activeRequest?.abort();
+  activeRequest = undefined;
+}
 
 const PROVIDER_LABELS: Record<Provider, string> = {
   deepseek: 'DeepSeek',
@@ -36,13 +50,25 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('llmTranslator.openPreview', () => openPreview()),
     vscode.commands.registerCommand('llmTranslator.refresh', () => {
       if (lastDocUri) {
-        translateDocument(lastDocUri);
+        translateDocument(lastDocUri, true);
       } else {
         openPreview();
       }
     }),
     vscode.commands.registerCommand('llmTranslator.setApiKey', () => setApiKeyCommand()),
-    vscode.commands.registerCommand('llmTranslator.clearApiKey', () => clearApiKeyCommand())
+    vscode.commands.registerCommand('llmTranslator.clearApiKey', () => clearApiKeyCommand()),
+    vscode.window.onDidChangeActiveTextEditor(editor => {
+      if (!panel || !editor || !isMarkdown(editor.document)) {
+        return;
+      }
+      cancelPending();
+      lastTranslation = undefined;
+      const uri = editor.document.uri;
+      followTimer = setTimeout(() => {
+        void translateDocument(uri).catch(err => vscode.window.showErrorMessage(String(err)));
+      }, 200);
+    }),
+    { dispose: () => { cancelPending(); translationCache.clear(); } }
   );
 }
 
@@ -119,17 +145,23 @@ async function resolveApiKey(provider: Provider): Promise<string | undefined> {
 
 async function openPreview() {
   const editor = vscode.window.activeTextEditor;
-  if (!editor || editor.document.languageId !== 'markdown') {
+  if (!editor || !isMarkdown(editor.document)) {
     vscode.window.showWarningMessage('Please open a Markdown file before using the translation preview.');
     return;
   }
   await translateDocument(editor.document.uri);
 }
 
-async function translateDocument(uri: vscode.Uri) {
+async function translateDocument(uri: vscode.Uri, force = false) {
+  cancelPending();
+  const controller = new AbortController();
+  activeRequest = controller;
+  const isCurrent = () => activeRequest === controller && !controller.signal.aborted;
   lastDocUri = uri;
+  lastTranslation = undefined;
 
   const document = await vscode.workspace.openTextDocument(uri);
+  if (!isCurrent()) { return; }
   const source = document.getText();
   const fileName = uri.path.split('/').pop() ?? 'README';
 
@@ -138,22 +170,29 @@ async function translateDocument(uri: vscode.Uri) {
   const model = config.get<string>(`${provider}.model`, '').trim() || '未配置模型';
   const targetLanguage = config.get<string>('targetLanguage', '中文').trim() || '中文';
   const modelLabel = `${PROVIDER_LABELS[provider] ?? provider} · ${model}`;
+  const cacheKey = createHash('sha256').update(JSON.stringify([
+    uri.toString(), source, provider, model,
+    config.get<string>(`${provider}.baseUrl`, ''), targetLanguage
+  ])).digest('hex');
+
+  ensurePanel();
+  panel!.title = `Translation Preview: ${fileName}`;
+  const cached = translationCache.get(cacheKey);
+  if (!force && cached !== undefined) {
+    lastTranslation = cached;
+    panel!.webview.html = renderResultHtml(cached, modelLabel, targetLanguage);
+    return;
+  }
+  panel!.webview.html = renderLoadingHtml('Translating, please wait…');
   const apiKey = await resolveApiKey(provider);
+  if (!isCurrent()) { return; }
   if (!apiKey) {
+    panel!.webview.html = renderErrorHtml('API key is not configured.', modelLabel, targetLanguage);
     vscode.window.showWarningMessage(
       `未配置 ${provider} 的 API Key,无法翻译。可运行 "LLM Translator: Set API Key" 命令设置。`
     );
     return;
   }
-
-  lastTranslation = undefined;
-
-  ensurePanel();
-  panel!.title = `Translation Preview: ${fileName}`;
-  panel!.webview.html = renderLoadingHtml('Translating, please wait…');
-
-  const controller = new AbortController();
-  panel!.onDidDispose(() => controller.abort());
 
   try {
     const result = await vscode.window.withProgress(
@@ -163,21 +202,28 @@ async function translateDocument(uri: vscode.Uri) {
         cancellable: true
       },
       (progress, token) => {
-        token.onCancellationRequested(() => controller.abort());
+        const cancellation = token.onCancellationRequested(() => controller.abort());
         return translateMarkdown(source, config, apiKey, {
           signal: controller.signal,
           onProgress: (done, total) => {
             progress.report({ message: `Chunk ${done}/${total}`, increment: 100 / total });
           }
-        });
+        }).finally(() => cancellation.dispose());
       }
     );
 
+    if (!isCurrent()) { return; }
+    translationCache.delete(cacheKey);
+    translationCache.set(cacheKey, result);
+    while (translationCache.size > 20) {
+      translationCache.delete(translationCache.keys().next().value!);
+    }
     lastTranslation = result;
     if (panel) {
       panel.webview.html = renderResultHtml(result, modelLabel, targetLanguage);
     }
   } catch (err: any) {
+    if (!isCurrent()) { return; }
     const message = err?.message ?? String(err);
     if (panel) {
       panel.webview.html = renderErrorHtml(message, modelLabel, targetLanguage);
@@ -204,7 +250,7 @@ function ensurePanel() {
         await saveTranslation();
       } else if (msg?.command === 'refresh') {
         if (lastDocUri) {
-          await translateDocument(lastDocUri);
+          await translateDocument(lastDocUri, true);
         }
       } else if (msg?.command === 'pickProvider') {
         await switchProvider();
@@ -216,6 +262,8 @@ function ensurePanel() {
     }
   });
   panel.onDidDispose(() => {
+    cancelPending();
+    lastTranslation = undefined;
     panel = undefined;
   });
 }

@@ -92,3 +92,9 @@ API keys are set and removed through the Command Palette rather than the regular
 ## License
 
 [MIT](LICENSE)
+
+### Following files and caching
+
+After opening the translation preview once, switching Markdown or Skill-language documents automatically updates the preview. Rapid switches cancel earlier requests, and stale results cannot overwrite the current document. Closing the preview stops following files.
+
+Up to 20 completed translations are cached in memory for the current extension session. Cache entries match the document URI, content, provider, model, API base URL, and target language. Reloading the window clears the cache; changing the content or these settings triggers a new translation. Refresh always requests a fresh translation.
