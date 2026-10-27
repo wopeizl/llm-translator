@@ -15,7 +15,13 @@ let panel: vscode.WebviewPanel | undefined;
 let lastDocUri: vscode.Uri | undefined;
 let lastTranslation: string | undefined;
 let secrets: vscode.SecretStorage;
-let activeRequest: AbortController | undefined;
+let viewGeneration = 0;
+interface TranslationTask {
+  controller: AbortController;
+  promise: Promise<string>;
+  progress: string;
+}
+const translationTasks = new Map<string, TranslationTask>();
 let followTimer: ReturnType<typeof setTimeout> | undefined;
 const translationCache = new Map<string, string>();
 
@@ -25,8 +31,11 @@ function isMarkdown(document: vscode.TextDocument) {
 
 function cancelPending() {
   clearTimeout(followTimer);
-  activeRequest?.abort();
-  activeRequest = undefined;
+  viewGeneration++;
+  for (const task of translationTasks.values()) {
+    task.controller.abort();
+  }
+  translationTasks.clear();
 }
 
 const PROVIDER_LABELS: Record<Provider, string> = {
@@ -61,7 +70,8 @@ export function activate(context: vscode.ExtensionContext) {
       if (!panel || !editor || !isMarkdown(editor.document)) {
         return;
       }
-      cancelPending();
+      clearTimeout(followTimer);
+      viewGeneration++;
       lastTranslation = undefined;
       const uri = editor.document.uri;
       followTimer = setTimeout(() => {
@@ -153,15 +163,14 @@ async function openPreview() {
 }
 
 async function translateDocument(uri: vscode.Uri, force = false) {
-  cancelPending();
-  const controller = new AbortController();
-  activeRequest = controller;
-  const isCurrent = () => activeRequest === controller && !controller.signal.aborted;
+  clearTimeout(followTimer);
+  const generation = ++viewGeneration;
+  const isCurrent = () => generation === viewGeneration && panel !== undefined;
   lastDocUri = uri;
   lastTranslation = undefined;
 
   const document = await vscode.workspace.openTextDocument(uri);
-  if (!isCurrent()) { return; }
+  if (generation !== viewGeneration) { return; }
   const source = document.getText();
   const fileName = uri.path.split('/').pop() ?? 'README';
 
@@ -183,52 +192,65 @@ async function translateDocument(uri: vscode.Uri, force = false) {
     panel!.webview.html = renderResultHtml(cached, modelLabel, targetLanguage);
     return;
   }
-  panel!.webview.html = renderLoadingHtml('Translating, please wait…');
-  const apiKey = await resolveApiKey(provider);
-  if (!isCurrent()) { return; }
-  if (!apiKey) {
-    panel!.webview.html = renderErrorHtml('API key is not configured.', modelLabel, targetLanguage);
-    vscode.window.showWarningMessage(
-      `未配置 ${provider} 的 API Key,无法翻译。可运行 "LLM Translator: Set API Key" 命令设置。`
-    );
-    return;
+  if (force) {
+    translationTasks.get(cacheKey)?.controller.abort();
+    translationTasks.delete(cacheKey);
   }
-
-  try {
-    const result = await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: 'Translating Markdown…',
-        cancellable: true
-      },
-      (progress, token) => {
-        const cancellation = token.onCancellationRequested(() => controller.abort());
-        return translateMarkdown(source, config, apiKey, {
-          signal: controller.signal,
-          onProgress: (done, total) => {
-            progress.report({ message: `Chunk ${done}/${total}`, increment: 100 / total });
-          }
-        }).finally(() => cancellation.dispose());
+  let task = translationTasks.get(cacheKey);
+  if (!task) {
+    const controller = new AbortController();
+    task = { controller, progress: 'Translating, please wait…', promise: Promise.resolve('') };
+    const runningTask = task;
+    task.promise = (async () => {
+      const apiKey = await resolveApiKey(provider);
+      if (controller.signal.aborted) { throw new Error('Translation cancelled.'); }
+      if (!apiKey) { throw new Error('API key is not configured.'); }
+      const result = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `Translating ${fileName}…`,
+          cancellable: true
+        },
+        (progress, token) => {
+          const cancellation = token.onCancellationRequested(() => controller.abort());
+          return translateMarkdown(source, config, apiKey, {
+            signal: controller.signal,
+            onProgress: (done, total) => {
+              runningTask.progress = `Chunk ${done}/${total}`;
+              progress.report({ message: runningTask.progress, increment: 100 / total });
+            }
+          }).finally(() => cancellation.dispose());
+        }
+      );
+      if (controller.signal.aborted) { throw new Error('Translation cancelled.'); }
+      translationCache.delete(cacheKey);
+      translationCache.set(cacheKey, result);
+      while (translationCache.size > 20) {
+        translationCache.delete(translationCache.keys().next().value!);
       }
-    );
-
+      return result;
+    })().finally(() => {
+      if (translationTasks.get(cacheKey) === runningTask) {
+        translationTasks.delete(cacheKey);
+      }
+    });
+    translationTasks.set(cacheKey, task);
+  }
+  panel!.webview.html = renderLoadingHtml(task.progress);
+  try {
+    const result = await task.promise;
     if (!isCurrent()) { return; }
-    translationCache.delete(cacheKey);
-    translationCache.set(cacheKey, result);
-    while (translationCache.size > 20) {
-      translationCache.delete(translationCache.keys().next().value!);
-    }
     lastTranslation = result;
-    if (panel) {
-      panel.webview.html = renderResultHtml(result, modelLabel, targetLanguage);
-    }
+    panel!.webview.html = renderResultHtml(result, modelLabel, targetLanguage);
   } catch (err: any) {
     if (!isCurrent()) { return; }
-    const message = err?.message ?? String(err);
-    if (panel) {
-      panel.webview.html = renderErrorHtml(message, modelLabel, targetLanguage);
+    const message = task.controller.signal.aborted
+      ? 'Translation cancelled. Click refresh to retry.'
+      : err?.message ?? String(err);
+    panel!.webview.html = renderErrorHtml(message, modelLabel, targetLanguage);
+    if (!task.controller.signal.aborted) {
+      vscode.window.showErrorMessage(`Translation failed: ${message}`);
     }
-    vscode.window.showErrorMessage(`Translation failed: ${message}`);
   }
 }
 

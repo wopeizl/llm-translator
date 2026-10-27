@@ -2,7 +2,7 @@
   "name": "llm-markdown-translator",
   "displayName": "LLM Markdown Translator",
   "description": "%extension.description%",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "publisher": "wentao-liao",
   "license": "MIT",
   "icon": "images/icon.png",
